@@ -1,0 +1,310 @@
+// =====================================================================
+// Clinic Finance DB - corrected version (PostgreSQL)
+//
+// Modelling assumptions (change them if they're wrong):
+//  * transactions = real cash movements only. Issuing an invoice does NOT
+//    create a transaction. Money moving does, and reconciliation links the two.
+//  * transactions.amount is always positive. Direction (in/out) comes from
+//    the category's financial_type.
+//  * Financial data is never hard-deleted: restrict + soft delete/void/cancel.
+//  * Rules DBML can't express (triggers, exclusion constraints, partial
+//    unique indexes, views) live in clinic_finance_v2_constraints.sql
+// =====================================================================
+
+Enum "enum_financial_type" {
+  "Income"
+  "Expense"
+}
+
+Enum "enum_periodicity" {
+  "Daily"
+  "Weekly"
+  "Biweekly"
+  "Monthly"
+  "Quarterly"
+  "Annual"
+  "Variable"
+}
+
+Enum "enum_transaction_status" {
+  "Completed"
+  "Pending"
+  "Cancelled"
+}
+
+// 'Fully Depreciated' removed: it is derived from dates (see v_clinic_assets)
+Enum "enum_asset_status" {
+  "Active"
+  "Sold"
+  "Damaged Write-Off"
+}
+
+// What a transaction means in relation to an asset
+Enum "enum_asset_link_type" {
+  "Purchase"
+  "Maintenance"
+  "Revenue"
+  "Other"
+}
+
+// ---------------------------------------------------------------------
+// Lookup tables
+// ---------------------------------------------------------------------
+
+Table "clinics" {
+  "id_clinic" SERIAL [pk, increment]
+  "clinic_name" varchar(150) [not null]
+  "address" TEXT
+  "active" BOOLEAN [not null, default: true, note: "Soft delete. Never cascade-delete a clinic's financial history"]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+}
+
+Table "roles" {
+  "id_role" SERIAL [pk, increment]
+  "role_name" varchar(50) [unique, not null]
+  "description" TEXT
+}
+
+Table "financial_categories" {
+  "id_category" SERIAL [pk, increment]
+  "financial_type" enum_financial_type [not null]
+  "category_name" varchar(100) [not null]
+  "suggested_periodicity" enum_periodicity [not null, default: 'Variable', note: "Hint for the UI only"]
+
+  indexes {
+    (financial_type, category_name) [unique]
+  }
+}
+
+Table "payment_methods" {
+  "id_method" SERIAL [pk, increment]
+  "method_name" varchar(50) [unique, not null]
+}
+
+Table "depreciation_categories" {
+  "id_dep_category" SERIAL [pk, increment]
+  "category_name" varchar(100) [unique, not null]
+  "useful_life_months" INT [not null, note: "Single source of truth. Straight-line annual % = 1200 / useful_life_months, so annual_percentage was removed (it could contradict this)"]
+
+  Checks {
+    `useful_life_months > 0` [name: 'chk_dep_life_positive']
+  }
+}
+
+Table "counterparties" {
+  "id_counterparty" SERIAL [pk, increment]
+  "counterparty_name" varchar(150) [not null]
+  "tax_id" varchar(50) [unique, note: "Optional, unique when present"]
+  "active" BOOLEAN [not null, default: true]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  Note: "Suppliers, patients, insurers... replaces the free-text issuer_receiver"
+}
+
+// ---------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------
+
+Table "users" {
+  "id_user" SERIAL [pk, increment]
+  "first_name" varchar(100) [not null]
+  "last_name" varchar(100) [not null]
+  "email" varchar(150) [unique, not null]
+  "phone" varchar(20)
+  "id_clinic" INT [note: "NULL = global/HQ user not tied to one clinic. If staff can work in several clinics, replace with a user_clinics junction table"]
+  "id_role" INT [not null]
+  "password_hash" varchar(255) [not null]
+  "active" BOOLEAN [not null, default: true]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+}
+
+// ---------------------------------------------------------------------
+// Assets and service lines (split: they were one table before)
+// ---------------------------------------------------------------------
+
+Table "service_lines" {
+  "id_service_line" SERIAL [pk, increment]
+  "id_clinic" INT [not null]
+  "service_name" varchar(150) [not null, note: "e.g. Office Visit, Counseling. A revenue/cost center, not a physical asset"]
+  "active" BOOLEAN [not null, default: true]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_clinic, service_name) [unique]
+    (id_service_line, id_clinic) [unique, note: "Target for the composite FK that keeps clinics consistent"]
+  }
+}
+
+Table "clinic_assets" {
+  "id_asset" SERIAL [pk, increment]
+  "id_clinic" INT [not null]
+  "asset_name" varchar(150) [not null]
+  "serial_number" varchar(100) [unique, note: "Optional for every asset"]
+  "is_depreciable" BOOLEAN [not null, default: true]
+  "id_dep_category" INT [note: "Required if and only if is_depreciable"]
+  "acquisition_cost" numeric(12,2) [not null, default: 0.00]
+  "purchase_date" DATE [not null, default: `CURRENT_DATE`]
+  "depreciation_start_date" DATE [note: "Required if and only if is_depreciable"]
+  "asset_status" enum_asset_status [not null, default: 'Active']
+  "disposal_date" DATE
+  "disposal_amount" numeric(12,2) [note: "Sale price, only meaningful when Sold"]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  indexes {
+    id_clinic
+    (id_asset, id_clinic) [unique, note: "Target for the composite FK that keeps clinics consistent"]
+  }
+
+  Checks {
+    `(is_depreciable AND id_dep_category IS NOT NULL AND depreciation_start_date IS NOT NULL) OR (NOT is_depreciable AND id_dep_category IS NULL AND depreciation_start_date IS NULL)` [name: 'chk_depreciation_conditional']
+    `acquisition_cost >= 0` [name: 'chk_asset_cost_nonneg']
+    `depreciation_start_date IS NULL OR depreciation_start_date >= purchase_date` [name: 'chk_dep_start_after_purchase']
+    `(asset_status = 'Active' AND disposal_date IS NULL AND disposal_amount IS NULL) OR (asset_status = 'Sold' AND disposal_date IS NOT NULL AND disposal_date >= purchase_date) OR (asset_status = 'Damaged Write-Off' AND disposal_date IS NOT NULL AND disposal_date >= purchase_date AND disposal_amount IS NULL)` [name: 'chk_asset_disposal']
+  }
+}
+
+Table "operator_allocations" {
+  "id_allocation" SERIAL [pk, increment]
+  "id_user" INT [not null]
+  "id_asset" INT
+  "id_service_line" INT
+  "allocation_percentage" numeric(5,2) [not null, default: 100.00, note: "Share of the user's working time/salary dedicated to this target"]
+  "assigned_at" DATE [not null, default: `CURRENT_DATE`]
+  "retracted_at" DATE [note: "NULL while the user is still assigned"]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  indexes {
+    id_user
+    id_asset
+    id_service_line
+  }
+
+  Checks {
+    `(id_asset IS NOT NULL AND id_service_line IS NULL) OR (id_asset IS NULL AND id_service_line IS NOT NULL)` [name: 'chk_alloc_exactly_one_target']
+    `allocation_percentage > 0 AND allocation_percentage <= 100` [name: 'chk_alloc_pct_range']
+    `retracted_at IS NULL OR retracted_at >= assigned_at` [name: 'chk_alloc_dates']
+  }
+
+  Note: "Replaces asset_operators. Also covers service lines. No-overlap and total <= 100% per user are enforced in the SQL file"
+}
+
+// ---------------------------------------------------------------------
+// Money
+// ---------------------------------------------------------------------
+
+Table "transactions" {
+  "id_transaction" BIGSERIAL [pk, increment]
+  "id_clinic" INT [not null]
+  "id_category" INT [not null]
+  "id_method" INT [not null]
+  "id_registered_by" INT [not null, note: "User who recorded the entry (was ambiguous id_user)"]
+  "id_payee_user" INT [note: "User who received the money, e.g. payroll. Needed for salary-based asset/service metrics"]
+  "id_asset" INT
+  "asset_link_type" enum_asset_link_type [note: "What this transaction is to the asset. Required iff id_asset is set"]
+  "id_service_line" INT
+  "amount" numeric(12,2) [not null, note: "Always positive. Direction comes from the category"]
+  "transaction_date" DATE [not null, default: `CURRENT_DATE`, note: "When the money actually moved. Entry time = created_at"]
+  "description" TEXT
+  "transaction_status" enum_transaction_status [not null, default: 'Completed']
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_clinic, transaction_date)
+    id_category
+    id_asset
+    id_service_line
+    id_payee_user
+  }
+
+  Checks {
+    `amount > 0` [name: 'chk_trx_amount_positive']
+    `(id_asset IS NULL) = (asset_link_type IS NULL)` [name: 'chk_trx_asset_link']
+  }
+}
+
+Table "invoices" {
+  "id_invoice" SERIAL [pk, increment]
+  "id_clinic" INT [not null]
+  "id_counterparty" INT [not null]
+  "id_category" INT [not null, note: "Income category = receivable, Expense category = payable. invoice_type was removed because it duplicated this"]
+  "total_amount" numeric(12,2) [not null]
+  "issue_date" DATE [not null]
+  "due_date" DATE [not null]
+  "is_void" BOOLEAN [not null, default: false]
+  "created_at" timestamptz [not null, default: `now()`]
+  "updated_at" timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_clinic, due_date)
+    id_counterparty
+    id_category
+  }
+
+  Checks {
+    `total_amount > 0` [name: 'chk_invoice_total_positive']
+    `due_date >= issue_date` [name: 'chk_invoice_dates']
+  }
+
+  Note: "Renamed from pending_invoices. amount_paid and reconciliation_status were removed: they are derived from reconciliation_history (see v_invoice_balances)"
+}
+
+Table "reconciliation_history" {
+  "id_reconciliation" SERIAL [pk, increment]
+  "id_invoice" INT [not null]
+  "id_transaction" BIGINT [not null]
+  "id_user" INT [not null]
+  "applied_amount" numeric(12,2) [not null]
+  "reconciliation_date" timestamptz [not null, default: `now()`]
+  "reversed_at" timestamptz [note: "Append-only audit trail: undo = set this, never delete"]
+
+  indexes {
+    id_invoice
+    id_transaction
+  }
+
+  Checks {
+    `applied_amount > 0` [name: 'chk_recon_amount_positive']
+  }
+
+  Note: "One ACTIVE link per (invoice, transaction) pair: partial unique index in the SQL file"
+}
+
+// ---------------------------------------------------------------------
+// Relationships (everything restrict: financial data is never cascaded away)
+// ---------------------------------------------------------------------
+
+Ref: "clinics"."id_clinic" < "users"."id_clinic" [delete: restrict]
+Ref: "roles"."id_role" < "users"."id_role" [delete: restrict]
+
+Ref: "clinics"."id_clinic" < "service_lines"."id_clinic" [delete: restrict]
+Ref: "clinics"."id_clinic" < "clinic_assets"."id_clinic" [delete: restrict]
+Ref: "depreciation_categories"."id_dep_category" < "clinic_assets"."id_dep_category" [delete: restrict]
+
+Ref: "users"."id_user" < "operator_allocations"."id_user" [delete: restrict]
+Ref: "clinic_assets"."id_asset" < "operator_allocations"."id_asset" [delete: restrict]
+Ref: "service_lines"."id_service_line" < "operator_allocations"."id_service_line" [delete: restrict]
+
+Ref: "clinics"."id_clinic" < "transactions"."id_clinic" [delete: restrict]
+Ref: "financial_categories"."id_category" < "transactions"."id_category" [delete: restrict]
+Ref: "payment_methods"."id_method" < "transactions"."id_method" [delete: restrict]
+Ref: "users"."id_user" < "transactions"."id_registered_by" [delete: restrict]
+Ref: "users"."id_user" < "transactions"."id_payee_user" [delete: restrict]
+
+// Composite FKs: the asset / service line must belong to the SAME clinic as the transaction
+Ref: "transactions".("id_asset", "id_clinic") > "clinic_assets".("id_asset", "id_clinic") [delete: restrict]
+Ref: "transactions".("id_service_line", "id_clinic") > "service_lines".("id_service_line", "id_clinic") [delete: restrict]
+
+Ref: "clinics"."id_clinic" < "invoices"."id_clinic" [delete: restrict]
+Ref: "counterparties"."id_counterparty" < "invoices"."id_counterparty" [delete: restrict]
+Ref: "financial_categories"."id_category" < "invoices"."id_category" [delete: restrict]
+
+Ref: "invoices"."id_invoice" < "reconciliation_history"."id_invoice" [delete: restrict]
+Ref: "transactions"."id_transaction" < "reconciliation_history"."id_transaction" [delete: restrict]
+Ref: "users"."id_user" < "reconciliation_history"."id_user" [delete: restrict]

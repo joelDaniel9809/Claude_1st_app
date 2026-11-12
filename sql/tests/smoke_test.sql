@@ -1,10 +1,10 @@
 -- =====================================================================
--- Smoke test for Clinic Finance DB v3.
+-- Smoke test for the Clinic Finance database (all migrations in sql/migrations).
 --
--- HOW TO RUN (pgAdmin): right-click the database -> Query Tool,
+-- HOW TO RUN (pgAdmin): right-click the clinic_dev database -> Query Tool,
 -- open this file, press Run (F5). Results are in the "Messages" tab:
 -- one PASS / FAIL line per test, and a summary at the end.
--- HOW TO RUN (psql): psql -U postgres -h localhost -d clinic_scratch -f sql/tests/smoke_test.sql
+-- HOW TO RUN (psql): psql -U postgres -h localhost -d clinic_dev -f sql/tests/smoke_test.sql
 --
 -- Everything runs inside one transaction that ends with ROLLBACK, so
 -- nothing is left behind. Test rows use ids 9001+ so they don't clash
@@ -50,7 +50,7 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 -- ---------------- seed test data ----------------
-INSERT INTO clinics (id_clinic, clinic_name) VALUES (9001, 'T North'), (9002, 'T South');
+INSERT INTO clinics (id_clinic, clinic_name, clinic_code) VALUES (9001, 'T North', 'TNOR'), (9002, 'T South', 'TSOU');
 INSERT INTO roles (id_role, role_name) VALUES (9001, 'T Admin'), (9002, 'T Staff');
 INSERT INTO role_permissions (id_role, id_permission)
   SELECT 9001, id_permission FROM permissions WHERE permission_code IN ('access.grant', 'audit.view');
@@ -66,7 +66,11 @@ SET LOCAL app.client_ip = '10.0.0.5';
 INSERT INTO financial_categories (id_category, financial_type, category_name) VALUES
   (9001, 'Income', 'T Consults'), (9002, 'Expense', 'T Supplies'), (9003, 'Income', 'T Lab');
 INSERT INTO payment_methods (id_method, method_name) VALUES (9001, 'T Cash');
-INSERT INTO counterparties (id_counterparty, counterparty_name) VALUES (9001, 'Patient A'), (9002, 'Patient B');
+-- A and B are shared (no clinic); C belongs to clinic South only
+INSERT INTO counterparties (id_counterparty, counterparty_name, counterparty_type, id_clinic) VALUES
+  (9001, 'Patient A', 'Patient', NULL),
+  (9002, 'Patient B', 'Patient', NULL),
+  (9003, 'Patient C', 'Patient', 9002);
 INSERT INTO depreciation_categories (id_dep_category, category_name, useful_life_months) VALUES (9001, 'T Equipment', 12);
 INSERT INTO clinic_assets (id_asset, id_clinic, asset_name, id_dep_category, depreciation_start_date, purchase_date) VALUES
   (9001, 9001, 'Ultrasound', 9001, '2024-01-01', '2024-01-01'),
@@ -300,6 +304,39 @@ BEGIN
                   invoice_number, invoice_type, financial_type, total_amount, amount_paid, outstanding, reconciliation_status)
       FROM v_invoice_balances WHERE id_invoice >= 9001 ORDER BY id_invoice
   LOOP RAISE NOTICE '%', r; END LOOP;
+
+  RAISE NOTICE '=== app additions (migration 0003) ===';
+  PERFORM pg_temp.expect_ok('bill numbers: TNOR-2026-0001 then TNOR-2026-0002, own counter per clinic',
+    $q$DO $x$ BEGIN
+         IF next_invoice_number(9001, '2026-05-01') <> 'TNOR-2026-0001' THEN RAISE EXCEPTION 'first number wrong'; END IF;
+         IF next_invoice_number(9001, '2026-06-01') <> 'TNOR-2026-0002' THEN RAISE EXCEPTION 'second number wrong'; END IF;
+         IF next_invoice_number(9002, '2026-06-01') <> 'TSOU-2026-0001' THEN RAISE EXCEPTION 'South should start at 0001'; END IF;
+         IF next_invoice_number(9001, '2027-01-02') <> 'TNOR-2027-0001' THEN RAISE EXCEPTION 'new year should restart'; END IF;
+       END $x$$q$);
+  PERFORM pg_temp.expect_fail('bill in North for a South-only patient',
+    'SET CONSTRAINTS invoice_total_on_invoice, invoice_total_on_lines DEFERRED;
+     INSERT INTO invoices (id_clinic,id_counterparty,invoice_number,financial_type,total_amount,issue_date,due_date) VALUES (9001,9003,''N-0500'',''Income'',10,''2026-03-01'',''2026-04-01'')');
+  PERFORM pg_temp.expect_fail('payment in North from a South-only patient',
+    'INSERT INTO transactions (id_clinic,id_category,id_method,id_registered_by,id_counterparty,amount) VALUES (9001,9001,9001,9001,9003,10)');
+  PERFORM pg_temp.expect_ok('payment in South from the South-only patient',
+    'INSERT INTO transactions (id_clinic,id_category,id_method,id_registered_by,id_counterparty,amount) VALUES (9002,9001,9001,9001,9003,10)');
+  PERFORM pg_temp.expect_fail('limit Patient A to North (already has a bill in South)',
+    'UPDATE counterparties SET id_clinic = 9001 WHERE id_counterparty = 9001');
+  PERFORM pg_temp.expect_fail('clinic code in lowercase',
+    'UPDATE clinics SET clinic_code = ''nor'' WHERE id_clinic = 9001');
+  PERFORM pg_temp.expect_fail('duplicate clinic code',
+    'UPDATE clinics SET clinic_code = ''TSOU'' WHERE id_clinic = 9001');
+  PERFORM pg_temp.expect_fail('unsupported language',
+    'UPDATE users SET preferred_language = ''fr'' WHERE id_user = 9002');
+  PERFORM pg_temp.expect_fail('two-factor on without a secret',
+    'UPDATE users SET totp_enabled = true WHERE id_user = 9002');
+  PERFORM pg_temp.expect_ok('two-factor secret never copied into the audit log',
+    $q$DO $x$ BEGIN
+         UPDATE users SET totp_secret = 'TOTPSECRET123', totp_enabled = true WHERE id_user = 9002;
+         IF NOT EXISTS (SELECT 1 FROM audit_log WHERE table_name = 'users' AND record_id = 9002
+                          AND details -> 'changes' ->> 'totp_secret' = 'changed') THEN RAISE EXCEPTION 'change not logged'; END IF;
+         IF EXISTS (SELECT 1 FROM audit_log WHERE details::text LIKE '%TOTPSECRET123%') THEN RAISE EXCEPTION 'secret leaked into log'; END IF;
+       END $x$$q$);
 
   RAISE NOTICE '=== updated_at trigger ===';
   PERFORM pg_temp.expect_ok('updated_at set automatically on update',

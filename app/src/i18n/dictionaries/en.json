@@ -1,0 +1,33 @@
+{
+  "app": {
+    "name": "Clinic Finance",
+    "tagline": "Keep track of your clinic's money, the simple way."
+  },
+  "language": {
+    "label": "Language",
+    "es": "Español",
+    "en": "English"
+  },
+  "home": {
+    "welcomeTitle": "Welcome",
+    "welcomeText": "This is the first version of the app. Soon you'll be able to record money in and out, create bills, and see who owes you.",
+    "whatNext": "What you'll be able to do here",
+    "features": {
+      "moneyIn": "Record money received",
+      "moneyOut": "Record money paid",
+      "bills": "Create bills and see which are still unpaid",
+      "reports": "See monthly summaries"
+    }
+  },
+  "status": {
+    "title": "System status",
+    "checking": "Checking the connection…",
+    "dbOk": "Database connected",
+    "dbError": "Couldn't connect to the database",
+    "dbErrorHelp": "Check that PostgreSQL is running and that the .env file has the right address.",
+    "roles": "Roles set up",
+    "permissions": "Permissions",
+    "categories": "Categories",
+    "clinics": "Clinics"
+  }
+}

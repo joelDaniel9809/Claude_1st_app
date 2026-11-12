@@ -150,34 +150,49 @@ On a brand-new system, a one-time wizard creates the first clinic and the first 
 | Database access | **Drizzle ORM** (types pulled from the existing schema) | SQL files stay the source of truth |
 | Migrations | **dbmate** (numbered `.sql` files) | Simple, SQL-only, has a Docker image |
 | Auth | **Auth.js** (credentials) + **argon2** + TOTP two-factor | Standard, no third-party login provider needed |
-| Translations | **next-intl** | ES/EN messages, date/number/currency formatting |
+| Translations | **Built-in Next.js approach**: JSON dictionaries + `next/root-params`, `/es/...` and `/en/...` URLs, `proxy.ts` picks the language | Native to Next.js 16, no extra library to keep compatible. Dates/money via the browser's `Intl` API |
 | PDFs | Generated server-side (library to decide when building reports) | Bills and reports |
 | Tests | **Playwright** (click-through) + **Vitest** (logic) + SQL smoke test | Screens, logic and database rules |
-| Runtime | **Node.js 22 LTS** | Required by Next.js. **Not installed yet** on the dev machine |
+| Runtime | **Node.js 26** (installed) | Required by Next.js 16 |
 
 ---
 
-## 7. Project structure (planned)
+## 7. Project structure
 
 ```
 /
-├─ docs/                    plans and decisions (this file)
+├─ docs/                          plans and decisions (this file)
 ├─ sql/
-│  ├─ Versions/v2, v3/      design history (dbdiagram + full SQL)
-│  ├─ migrations/           dbmate migrations (v3 becomes migration 0001)
-│  └─ tests/                SQL smoke test
-├─ app/                     Next.js app
-│  ├─ src/app/[locale]/...  pages, per language (/es/..., /en/...)
-│  ├─ src/components/       UI components
-│  ├─ src/server/           database access, permission checks, actions
-│  ├─ src/lib/errors.ts     database error → friendly message map
-│  ├─ messages/es.json      Spanish text
-│  ├─ messages/en.json      English text
-│  └─ tests/                Playwright and Vitest
-├─ docker/                  Dockerfiles, Caddyfile
-├─ docker-compose.yml
-└─ .env.example             settings template (real .env is never committed)
+│  ├─ Versions/v2, v3/            design history (dbdiagram + full SQL)
+│  ├─ migrations/                 dbmate migrations: the real source of truth
+│  │   0100 v3 schema · 0200 reference data · 0300 app additions
+│  └─ tests/smoke_test.sql        database rule tests (rolled back)
+├─ app/                           Next.js app
+│  ├─ .env / .env.example         settings (.env is never committed)
+│  ├─ src/proxy.ts                sends "/" to /es or /en
+│  ├─ src/app/[lang]/...          pages, per language
+│  ├─ src/i18n/                   language config + dictionaries/es.json, en.json
+│  ├─ src/components/             UI components (ui/ = shadcn)
+│  ├─ src/server/db/              database connection, withActor() helper,
+│  │   generated/                 table types pulled from the database
+│  ├─ src/lib/errors.ts           (milestone 1+) database error → friendly message
+│  └─ tests/                      (later) Playwright and Vitest
+├─ docker/                        (milestone 9) Dockerfiles, Caddyfile
+└─ docker-compose.yml             (milestone 9)
 ```
+
+### Everyday commands (run inside `app/`)
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | Start the app at http://localhost:3000 |
+| `npm run db:migrate` | Apply new migrations (creates the database if missing) |
+| `npm run db:status` | Show which migrations are applied |
+| `npm run db:new <name>` | Create a new, empty migration file |
+| `npm run db:pull` | Refresh the TypeScript table types after a migration |
+| `npm run typecheck` / `npm run lint` / `npm run build` | Checks before committing |
+
+**Changing the database:** `db:new` → write the SQL (with a `-- migrate:down` part) → `db:migrate` → run the smoke test → `db:pull`. Never edit a migration that has already been applied; add a new one.
 
 ---
 
@@ -205,8 +220,8 @@ The database rules raise precise messages. `src/lib/errors.ts` maps each one (by
 
 **Rule:** forms validate first (Zod), so most of these never reach the database. The database rules remain the safety net.
 
-### 8.4 Database additions the app needs (migration 0002)
-v3 covers the finance rules, but some features in this plan need extra columns. They'll be added as one migration in milestones 0–1, and the DBML in dbdiagram will be updated to match.
+### 8.4 Database additions the app needs (migration 0003, ✅ done)
+v3 covers the finance rules, but some features in this plan need extra columns. They're in `sql/migrations/20261111000300_app_additions.sql`, with tests in the smoke test. The DBML in dbdiagram still needs updating to match (v4).
 
 | Table | Addition | Needed for |
 |---|---|---|
@@ -217,7 +232,9 @@ v3 covers the finance rules, but some features in this plan need extra columns. 
 | `counterparties` | `counterparty_type` (`Patient` / `Supplier` / `Insurer` / `Other`) | Tabs and filters "Patient / Supplier / Insurer" (§4, §5) |
 | `counterparties` | `id_clinic` (nullable = shared, e.g. a supplier used by all clinics) | Patients belong to one clinic, so staff only see their clinic's patients |
 | `clinics` | `clinic_code` (short, unique, e.g. `NOR`) | Bill numbers like `NOR-2026-0001` (§13) |
-| new `invoice_number_sequences` | one counter per clinic and year | Gap-free automatic bill numbers |
+| new `invoice_number_sequences` + `next_invoice_number(clinic, date)` | one counter per clinic and year | Gap-free automatic bill numbers |
+| rule | a bill/payment can only use a patient/supplier of its own clinic (or a shared one) | Keeps clinics' data apart |
+| `trg_audit_row` | also masks `totp_secret` | Two-factor secrets never reach the activity log |
 | sessions | handled by Auth.js (JWT or a sessions table, decided in milestone 1) | Login sessions |
 
 **Note on `counterparties.id_clinic`:** without it, every clinic's staff could see every clinic's patients, which conflicts with the "own clinic only" rule. This is the most important addition.
@@ -260,7 +277,7 @@ Each milestone ends with something usable and tested.
 
 | # | Milestone | Done when |
 |---|---|---|
-| 0 | **Dev setup:** install Node.js 22; create the Next.js project, Tailwind + shadcn, next-intl (ES/EN), Drizzle connected to `clinic_scratch`, v3 as dbmate migration 0001, app additions as migration 0002 (§8.4) | App starts in both languages and reads the database; SQL smoke test still passes |
+| 0 ✅ | **Dev setup:** Next.js 16, Tailwind + shadcn, ES/EN routing and dictionaries, Drizzle + `withActor()` audit helper, dbmate migrations (v3 schema, reference data, app additions) into `clinic_dev` | App starts in both languages and reads the database; SQL smoke test passes (78/78) |
 | 1 | **Login and access:** first-run wizard, login, 2FA, lockout, session timeout, role-based menu, the "set user in transaction" helper, activity logging | Each seed role logs in and sees only its menu; logins appear in the activity history |
 | 2 | **Settings:** clinics, categories, payment methods, patients/suppliers | Manager can set up a clinic from scratch |
 | 3 | **Money in / out** | Record, edit, cancel; list with filters and totals |
@@ -306,4 +323,6 @@ docker-compose.yml
 | Patients visible across clinics | v3 `counterparties` has no clinic, so all clinics would share one patient list. Fixed by `counterparties.id_clinic` in migration 0002 (§8.4). |
 | Insurance claims | Out of scope for now. Insurers are just a type of counterparty. |
 | Multi-clinic users | Users have one home clinic; others only via HQ permission or temporary access. Revisit if managers run several clinics. |
-| Node.js / Docker | Not installed yet on the dev machine; needed for milestones 0 and 9. |
+| Docker | Not installed yet on the dev machine; needed for milestone 9. |
+| DBML out of date | `sql/Versions/v3/*.dbml` doesn't include migration 0003 yet. Update dbdiagram to a v4 before the next design review. |
+| `clinic_scratch` database | Old manual test database from before migrations. Can be dropped; `clinic_dev` replaces it. |

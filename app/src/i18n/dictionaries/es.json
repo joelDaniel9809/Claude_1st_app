@@ -1,0 +1,33 @@
+{
+  "app": {
+    "name": "Finanzas de la Clínica",
+    "tagline": "Lleve el control del dinero de su clínica, de forma sencilla."
+  },
+  "language": {
+    "label": "Idioma",
+    "es": "Español",
+    "en": "English"
+  },
+  "home": {
+    "welcomeTitle": "Bienvenido",
+    "welcomeText": "Esta es la primera versión de la aplicación. Pronto podrá registrar el dinero recibido y pagado, crear facturas y ver quién le debe.",
+    "whatNext": "¿Qué podrá hacer aquí?",
+    "features": {
+      "moneyIn": "Registrar el dinero recibido",
+      "moneyOut": "Registrar el dinero pagado",
+      "bills": "Crear facturas y ver cuáles faltan por cobrar",
+      "reports": "Ver resúmenes del mes"
+    }
+  },
+  "status": {
+    "title": "Estado del sistema",
+    "checking": "Revisando la conexión…",
+    "dbOk": "Base de datos conectada",
+    "dbError": "No se pudo conectar con la base de datos",
+    "dbErrorHelp": "Revise que PostgreSQL esté encendido y que el archivo .env tenga la dirección correcta.",
+    "roles": "Roles configurados",
+    "permissions": "Permisos",
+    "categories": "Categorías",
+    "clinics": "Clínicas"
+  }
+}
